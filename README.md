@@ -26,8 +26,9 @@ print(next()); print(next()); print(next());   // 1 2 3
 ## 运行
 
 ```bash
-python tinylang.py demo.ty   # 执行脚本
-python tinylang.py           # REPL
+python tinylang.py demo.ty        # 执行脚本(树求值器)
+python tinylang.py --vm demo.ty   # 执行脚本(字节码 VM)
+python tinylang.py [--vm]         # REPL
 ```
 
 ## 里程碑
@@ -42,7 +43,12 @@ python tinylang.py           # REPL
   一等函数与匿名函数、递归、if/while/for、return 非局部退出、
   原生函数(print/len/clock)、类型检查与运行时错误、REPL(括号不闭合自动续行)、
   脚本 CLI(26 个单测,含子进程集成)。
-- [ ] M4(可选)字节码 VM
+- [x] **M4 字节码 VM**:两遍编译(名字解析与捕获分析 → wordcode 代码生成,
+  与 CPython 同款"操作码 + 操作数字"布局)、基于栈的虚拟机与函数调用帧、
+  cell + 捕获链实现的 **upvalue 闭包**(跨层捕获、双闭包共享变量、
+  局部命名函数自递归)、短路跳转、`--vm` 开关。
+  测试采用**双后端对拍**:同一批程序在树求值器与 VM 上输出逐行一致(14 个单测)。
+  树求值器保留为默认后端与语义参照。
 
 ## 语义要点
 
