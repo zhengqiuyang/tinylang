@@ -5,9 +5,12 @@ M1 词法分析:手写 scanner。双引号字符串(\\n \\t \\" \\\\ 转义)、�
    int/float 数字、关键字表、行列号错误定位。
 M2 Pratt 解析:优先级爬升(绑定力表)、左/右结合、一元与后缀调用、
    函数声明与函数表达式、完整语句语法,错误带 token 定位。
-M3 树求值器:词法作用域、闭包、控制流
+M3 树求值器:环境链实现词法作用域、闭包与一等函数、if/while/for、
+   return 信号、原生函数(print/len/clock)、REPL 与脚本执行。
 """
 import enum
+import sys
+import time
 from dataclasses import dataclass
 
 
@@ -581,3 +584,343 @@ class Parser:
 def parse_program(src):
     """把源码解析成语句列表(AST 顶层)。"""
     return Parser(tokenize(src)).program()
+
+
+# ---------- 求值器(M3) ----------
+
+def format_value(v):
+    """值的展示形式(print 与 REPL 共用)。"""
+    if v is None:
+        return "nil"
+    if v is True:
+        return "true"
+    if v is False:
+        return "false"
+    if isinstance(v, float):
+        if v.is_integer() and abs(v) < 1e16:
+            return str(int(v))
+        return repr(v)
+    if isinstance(v, TinyFunction):
+        return "<fun>"
+    if isinstance(v, NativeFunction):
+        return "<native fun>"
+    return str(v)
+
+
+def truthy(v):
+    """tinylang 的真值规则:只有 nil 和 false 为假,0 与空串为真。"""
+    return v is not None and v is not False
+
+
+def _is_num(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def tinylang_eq(a, b):
+    """相等性:类型不同的 true/1 不相等,其余同 Python。"""
+    if isinstance(a, bool) != isinstance(b, bool):
+        return False
+    return a == b
+
+
+class Environment:
+    """词法作用域环境链:define 定义在当前层,get/assign 沿父链查找。"""
+    __slots__ = ("values", "parent")
+
+    def __init__(self, parent=None):
+        self.values = {}
+        self.parent = parent
+
+    def define(self, name, value):
+        self.values[name] = value
+
+    def get(self, name):
+        env = self
+        while env is not None:
+            if name in env.values:
+                return env.values[name]
+            env = env.parent
+        raise TinyError(f"未定义的变量 {name!r}")
+
+    def assign(self, name, value):
+        env = self
+        while env is not None:
+            if name in env.values:
+                env.values[name] = value
+                return
+            env = env.parent
+        raise TinyError(f"未定义的变量 {name!r}")
+
+
+class TinyFunction:
+    """用户函数:参数、函数体、定义时的闭包环境。"""
+    __slots__ = ("params", "body", "closure")
+
+    def __init__(self, params, body, closure):
+        self.params = params
+        self.body = body
+        self.closure = closure
+
+
+class NativeFunction:
+    """原生函数:fn(interpreter, args) -> value;arity 为 None 表示不限。"""
+    __slots__ = ("name", "arity", "fn")
+
+    def __init__(self, name, arity, fn):
+        self.name = name
+        self.arity = arity
+        self.fn = fn
+
+
+class ReturnSignal(Exception):
+    """return 的非局部退出。"""
+
+    def __init__(self, value):
+        super().__init__("return")
+        self.value = value
+
+
+class Interpreter:
+    """树求值器。output(text) 用于 print 输出,便于测试注入。"""
+
+    def __init__(self, output=None):
+        self.globals = Environment()
+        self.output = output if output is not None else print
+        self._install_natives()
+
+    # ----- 原生函数 -----
+
+    def _install_natives(self):
+        self.globals.define("print", NativeFunction("print", None, self._print))
+        self.globals.define("len", NativeFunction("len", 1, self._len))
+        self.globals.define("clock", NativeFunction("clock", 0, self._clock))
+
+    def _print(self, _interp, args):
+        self.output(" ".join(format_value(a) for a in args))
+        return None
+
+    @staticmethod
+    def _len(_interp, args):
+        v = args[0]
+        if isinstance(v, str):
+            return len(v)
+        raise TinyError(f"len 只接受字符串,得到 {format_value(v)}")
+
+    @staticmethod
+    def _clock(_interp, _args):
+        return time.time()
+
+    # ----- 语句 -----
+
+    def run_program(self, stmts):
+        try:
+            for stmt in stmts:
+                self.exec_stmt(stmt, self.globals)
+        except ReturnSignal:
+            raise TinyError("return 不能出现在函数体外") from None
+
+    def exec_stmt(self, stmt, env):
+        if isinstance(stmt, VarDecl):
+            env.define(stmt.name, self.eval(stmt.init, env))
+        elif isinstance(stmt, FunDecl):
+            env.define(stmt.name,
+                       TinyFunction(stmt.fun.params, stmt.fun.body, env))
+        elif isinstance(stmt, ExprStmt):
+            self.eval(stmt.expr, env)
+        elif isinstance(stmt, Block):
+            block_env = Environment(env)
+            for s in stmt.body:
+                self.exec_stmt(s, block_env)
+        elif isinstance(stmt, If):
+            if truthy(self.eval(stmt.cond, env)):
+                self.exec_stmt(stmt.then, env)
+            elif stmt.otherwise is not None:
+                self.exec_stmt(stmt.otherwise, env)
+        elif isinstance(stmt, While):
+            while truthy(self.eval(stmt.cond, env)):
+                self.exec_stmt(stmt.body, env)
+        elif isinstance(stmt, For):
+            loop_env = Environment(env)
+            if stmt.init is not None:
+                self.exec_stmt(stmt.init, loop_env)
+            while stmt.cond is None or truthy(self.eval(stmt.cond, loop_env)):
+                self.exec_stmt(stmt.body, loop_env)
+                if stmt.step is not None:
+                    self.eval(stmt.step, loop_env)
+        elif isinstance(stmt, Return):
+            value = self.eval(stmt.value, env) if stmt.value is not None else None
+            raise ReturnSignal(value)
+        else:  # pragma: no cover
+            raise TinyError(f"未知语句节点 {stmt!r}")
+
+    # ----- 表达式 -----
+
+    def eval(self, expr, env):
+        if isinstance(expr, (Num, Str, Bool)):
+            return expr.value
+        if isinstance(expr, Nil):
+            return None
+        if isinstance(expr, Var):
+            return env.get(expr.name)
+        if isinstance(expr, Assign):
+            value = self.eval(expr.value, env)
+            env.assign(expr.name, value)
+            return value
+        if isinstance(expr, Logical):
+            left = self.eval(expr.left, env)
+            if expr.op == "&&":
+                return self.eval(expr.right, env) if truthy(left) else left
+            return left if truthy(left) else self.eval(expr.right, env)
+        if isinstance(expr, Binop):
+            return self._binop(expr, env)
+        if isinstance(expr, Unop):
+            v = self.eval(expr.operand, env)
+            if expr.op == "-":
+                if _is_num(v):
+                    return -v
+                raise TinyError(f"一元 '-' 只能用于数字,得到 {format_value(v)}")
+            return not truthy(v)  # '!'
+        if isinstance(expr, Call):
+            return self._call(expr, env)
+        if isinstance(expr, FunExpr):
+            return TinyFunction(expr.params, expr.body, env)
+        raise TinyError(f"未知表达式节点 {expr!r}")  # pragma: no cover
+
+    def _binop(self, expr, env):
+        left = self.eval(expr.left, env)
+        right = self.eval(expr.right, env)
+        op = expr.op
+        if op == "+":
+            if isinstance(left, str) and isinstance(right, str):
+                return left + right
+            if _is_num(left) and _is_num(right):
+                return left + right
+            raise TinyError(f"{format_value(left)} 与 {format_value(right)} "
+                            f"不能相加(仅限数字或两个字符串)")
+        if op in ("-", "*", "/", "%"):
+            if not (_is_num(left) and _is_num(right)):
+                raise TinyError(f"运算符 {op!r} 只能用于数字:"
+                                f"{format_value(left)} {op} {format_value(right)}")
+            if op == "-":
+                return left - right
+            if op == "*":
+                return left * right
+            if right == 0:
+                raise TinyError("除以零" if op == "/" else "对零取模")
+            return left / right if op == "/" else left % right
+        if op in ("<", ">", "<=", ">="):
+            if not (_is_num(left) and _is_num(right)):
+                raise TinyError(f"比较运算只能用于数字:"
+                                f"{format_value(left)} {op} {format_value(right)}")
+            if op == "<":
+                return left < right
+            if op == ">":
+                return left > right
+            if op == "<=":
+                return left <= right
+            return left >= right
+        if op == "==":
+            return tinylang_eq(left, right)
+        return not tinylang_eq(left, right)  # '!='
+
+    def _call(self, expr, env):
+        callee = self.eval(expr.callee, env)
+        args = [self.eval(a, env) for a in expr.args]
+        if isinstance(callee, NativeFunction):
+            if callee.arity is not None and len(args) != callee.arity:
+                raise TinyError(f"{callee.name} 需要 {callee.arity} 个参数,"
+                                f"得到 {len(args)}")
+            return callee.fn(self, args)
+        if isinstance(callee, TinyFunction):
+            if len(args) != len(callee.params):
+                raise TinyError(f"函数需要 {len(callee.params)} 个参数,"
+                                f"得到 {len(args)}")
+            call_env = Environment(callee.closure)
+            for name, value in zip(callee.params, args):
+                call_env.define(name, value)
+            try:
+                for s in callee.body:
+                    self.exec_stmt(s, call_env)
+            except ReturnSignal as sig:
+                return sig.value
+            return None
+        raise TinyError(f"{format_value(callee)} 不可调用")
+
+
+# ---------- 入口:脚本执行与 REPL ----------
+
+def run_source(src, output=None):
+    """编译并执行一段源码,返回解释器实例。"""
+    interp = Interpreter(output)
+    interp.run_program(parse_program(src))
+    return interp
+
+
+def _is_complete(src):
+    """REPL 用:括号/花括号不闭合时继续等待输入。"""
+    try:
+        tokens = tokenize(src)
+    except TinyError:
+        return True  # 词法错误直接交给解析器报告
+    depth = 0
+    for t in tokens:
+        if t.type in (TokenType.LBRACE, TokenType.LPAREN):
+            depth += 1
+        elif t.type in (TokenType.RBRACE, TokenType.RPAREN):
+            depth -= 1
+    return depth <= 0
+
+
+def repl():
+    interp = Interpreter()
+    buffer = ""
+    print("tinylang REPL —— 语句以 ; 结尾;Ctrl-C / Ctrl-D 退出")
+    while True:
+        try:
+            line = input("... " if buffer else ">>> ")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 0
+        buffer += line + "\n"
+        if not _is_complete(buffer):
+            continue
+        src, buffer = buffer, ""
+        try:
+            stmts = parse_program(src)
+        except TinyError as e:
+            print(f"解析错误: {e.where()}")
+            continue
+        try:
+            for s in stmts:
+                if isinstance(s, ExprStmt):
+                    print(format_value(interp.eval(s.expr, interp.globals)))
+                else:
+                    interp.exec_stmt(s, interp.globals)
+        except ReturnSignal:
+            print("运行错误: return 不能出现在函数体外")
+        except TinyError as e:
+            print(f"运行错误: {e.where()}")
+
+
+def main(argv):
+    if len(argv) > 2:
+        print("用法: python tinylang.py [script.ty]", file=sys.stderr)
+        return 2
+    if len(argv) == 2:
+        try:
+            with open(argv[1], encoding="utf-8") as f:
+                src = f.read()
+        except OSError as e:
+            print(f"无法读取脚本: {e}", file=sys.stderr)
+            return 2
+        try:
+            run_source(src)
+        except TinyError as e:
+            print(f"错误: {e.where()}", file=sys.stderr)
+            return 1
+        return 0
+    return repl()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

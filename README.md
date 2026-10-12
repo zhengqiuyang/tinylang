@@ -23,6 +23,13 @@ var next = make_counter();
 print(next()); print(next()); print(next());   // 1 2 3
 ```
 
+## 运行
+
+```bash
+python tinylang.py demo.ty   # 执行脚本
+python tinylang.py           # REPL
+```
+
 ## 里程碑
 
 - [x] **M1 词法分析器**:手写 scanner。双引号字符串(`\n \t \" \\` 转义)、
@@ -31,5 +38,15 @@ print(next()); print(next()); print(next());   // 1 2 3
 - [x] **M2 Pratt 解析器 → AST**:优先级爬升(绑定力表驱动)、左结合/右结合(赋值)、
   一元运算、后缀调用链 `f(1)(2)`、函数声明与 `fun` 函数表达式、if/while/for/return/
   块语句、悬垂 else 归最近 if、语法错误带行列号定位(26 个单测)。
-- [ ] M3 树求值器:词法作用域、闭包、if/while/for、return
+- [x] **M3 树求值器**:环境链实现词法作用域与块级遮蔽、闭包捕获定义时环境、
+  一等函数与匿名函数、递归、if/while/for、return 非局部退出、
+  原生函数(print/len/clock)、类型检查与运行时错误、REPL(括号不闭合自动续行)、
+  脚本 CLI(26 个单测,含子进程集成)。
 - [ ] M4(可选)字节码 VM
+
+## 语义要点
+
+- 真值规则:只有 `nil` 和 `false` 为假,`0` 与空串为真(同 Lox,异于 Python)。
+- `+` 只允许数字相加或两个字符串拼接;比较运算只允许数字。
+- `true == 1` 为 `false`(bool 与数字不相等,严格区分类型)。
+- `/` 遵循 Python 语义(总是浮点);`%` 取模,除以零报运行时错误。
